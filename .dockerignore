@@ -1,0 +1,13 @@
+.git
+.venv
+artifacts
+data
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+per_task_report_*.json
+manual_sql_report.json
+tree_output
+tree_run
+update.log

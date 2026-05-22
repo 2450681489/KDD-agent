@@ -6,7 +6,7 @@ from collections import Counter
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
-PRED_DIR = "artifacts/runs/20260518T063034Z"
+PRED_DIR = "tmp_output"
 GOLD_DIR = "data/public/output"
 
 NULL_STRINGS = {"", "null", "none", "nan", "nat", "<na>"}
