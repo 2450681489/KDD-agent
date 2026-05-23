@@ -76,13 +76,16 @@ def build_model_adapter(config: AppConfig):
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f"{path.name}.tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     temp_path.replace(path)
 
 
 def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as handle:
+    with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(columns)
         for row in rows:
@@ -129,6 +132,7 @@ def _run_single_task_core(
             knowledge_top_k_plan=config.agent.knowledge_top_k_plan,
             knowledge_top_k_sql=config.agent.knowledge_top_k_sql,
             knowledge_chunk_max_chars=config.agent.knowledge_chunk_max_chars,
+            markdown_extract_max_workers=config.agent.markdown_extract_max_workers,
         ),
         trace_callback=write_trace_snapshot,
     )

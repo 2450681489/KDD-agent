@@ -85,6 +85,10 @@ Important:
 - Use `context/knowledge.md` to understand what tables and columns mean.
 - Use `context/knowledge.md` only as a semantic supplement for tables and columns that already exist in the DataEngine schema.
 - Never invent new tables or columns from `knowledge.md`. If the document mentions a field that is not present in the DataEngine schema, do not add it to the catalog.
+- Tables whose names end with `_llm` are query-focused markdown extraction supplements.
+  If a base table with the same prefix exists and already has the needed fields, prefer the
+  base table as the primary source. Use `_llm` tables only for missing fields, cross-checks,
+  or explicit fallback; do not automatically union base and `_llm` tables.
 
 Return JSON with this shape:
 {
@@ -143,6 +147,16 @@ Important:
 - Read `context/doc/*.md` to find business rules, join conditions, aggregation definitions, aliases, and filtering constraints.
 - Use those document-derived conditions explicitly in the plan when they affect joins, filters, aggregations, grouping, ordering, or validation.
 - Read markdown/text documents as task instructions or semantic hints, not as queryable tables.
+- For current-age wording such as "age", "under N", "over N", "not N yet",
+  or "aren't N yet", calculate age from the current year and the patient's
+  birth year unless the question explicitly asks for age at an event/test/admission
+  date. Do not use lab, examination, admission, or row dates as a proxy for current
+  age without explicit wording.
+- Tables ending in `_llm` are supplemental rows extracted from selected markdown chunks.
+  Prefer the corresponding base table when it contains the needed columns. Use `_llm`
+  only when the base table lacks the needed field/value, as a validation aid, or when the
+  task specifically needs the extracted subset. Avoid unioning base and `_llm` versions
+  unless the plan can justify that they are non-overlapping sources.
 
 Return JSON with this shape:
 {
@@ -214,6 +228,10 @@ Input format:
 
 Important:
 - The schema describes loaded relational tables. It is not raw JSON and not raw CSV.
+- For current-age filters or expressions, use `CURRENT_TIMESTAMP` with the birth
+  date column, for example `EXTRACT(YEAR FROM CURRENT_TIMESTAMP) - EXTRACT(YEAR FROM CAST(Birthday AS DATE))`.
+  Use an event date such as lab/exam/admission date only when the plan or question
+  explicitly asks for age at that event.
 - Write SQL against tables and columns only.
 - Do not use JSON extraction syntax, file-reading assumptions, or CSV parsing logic unless such values are already present as ordinary string columns.
 - Use lowercase table names exactly as shown in the schema/catalog.

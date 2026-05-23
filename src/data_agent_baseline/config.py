@@ -34,6 +34,7 @@ class AgentConfig:
     knowledge_top_k_plan: int = 4
     knowledge_top_k_sql: int = 3
     knowledge_chunk_max_chars: int = 1200
+    markdown_extract_max_workers: int = 4
     model_request_timeout_seconds: float = 120.0
     model_max_retries: int = 2
     model_retry_backoff_seconds: float = 2.0
@@ -107,6 +108,12 @@ def load_app_config(config_path: Path) -> AppConfig:
         ),
         knowledge_chunk_max_chars=int(
             agent_payload.get("knowledge_chunk_max_chars", agent_defaults.knowledge_chunk_max_chars)
+        ),
+        markdown_extract_max_workers=int(
+            agent_payload.get(
+                "markdown_extract_max_workers",
+                agent_defaults.markdown_extract_max_workers,
+            )
         ),
         model_request_timeout_seconds=float(
             agent_payload.get(

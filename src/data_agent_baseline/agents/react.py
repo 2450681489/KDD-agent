@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,11 @@ from data_agent_baseline.tools.registry import ToolRegistry, create_dataengine_t
 SQL_HISTORY_WINDOW = 2
 SQL_PREVIEW_ROWS = 2
 SQL_ERROR_CHARS = 240
+MARKDOWN_LLM_MAX_SELECTED_CHUNKS = 120
+MARKDOWN_LLM_BATCH_CHUNKS = 24
+MARKDOWN_LLM_MAX_CHUNK_CHARS = 1100
+MARKDOWN_LLM_MAX_CONTEXT_CHARS = 22000
+MARKDOWN_LLM_MAX_SELECTED_CHARS = 120000
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +56,7 @@ class ReActAgentConfig:
     knowledge_top_k_plan: int = 4
     knowledge_top_k_sql: int = 3
     knowledge_chunk_max_chars: int = 1200
+    markdown_extract_max_workers: int = 4
 
 
 def _strip_json_fence(raw_response: str) -> str:
@@ -471,6 +478,73 @@ def _collect_catalog_terms(catalog: dict[str, Any]) -> list[str]:
     return terms
 
 
+def _tokenize_query_text(text: str) -> set[str]:
+    stop_words = {
+        "among",
+        "whose",
+        "them",
+        "they",
+        "their",
+        "there",
+        "that",
+        "this",
+        "what",
+        "which",
+        "with",
+        "without",
+        "have",
+        "has",
+        "how",
+        "many",
+        "much",
+        "patient",
+        "patients",
+        "level",
+        "levels",
+        "number",
+        "count",
+        "aren",
+        "isn",
+        "yet",
+    }
+    tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9_]+", text)
+        if len(token) >= 3 and token.lower() not in stop_words
+    }
+    expansions = {
+        "creatinine": {"cre", "renal", "kidney", "glomerular", "filtration"},
+        "cre": {"creatinine", "renal", "kidney"},
+        "abnormal": {"elevated", "high", "impaired", "borderline", "normal"},
+        "age": {"birthday", "birthdate", "born"},
+        "birthday": {"age", "birthdate", "born"},
+        "diagnosis": {"diagnosed", "disease"},
+        "admission": {"inpatient", "outpatient", "admitted"},
+    }
+    for token in list(tokens):
+        tokens.update(expansions.get(token, set()))
+    if re.search(r"\b\d{1,3}\b", text) and re.search(r"\b(?:age|old|younger|older|yet|under|over)\b", text, flags=re.IGNORECASE):
+        tokens.update({"age", "birthday", "birthdate", "born"})
+    return tokens
+
+
+def _extract_numeric_ids_from_text(text: str) -> set[str]:
+    return set(re.findall(r"\b\d{4,9}\b", text))
+
+
+def _extract_patient_ids_from_text(text: str) -> set[str]:
+    patterns = [
+        r"\bpatient(?:\s+(?:assigned|registered|associated|with|number|file|ID))*\s*(?:number|ID)?\s*(\d{4,9})\b",
+        r"\bMedical Record Number\s+(\d{4,9})\b",
+        r"\bfile number\s+(\d{4,9})\b",
+        r"\bfile\s+(\d{4,9})\b",
+    ]
+    ids: set[str] = set()
+    for pattern in patterns:
+        ids.update(match.group(1) for match in re.finditer(pattern, text, flags=re.IGNORECASE))
+    return ids
+
+
 class ReActAgent:
     def __init__(
         self,
@@ -539,6 +613,412 @@ class ReActAgent:
         markdown_paths = sorted(path for path in doc_dir.rglob("*.md") if path.is_file())
         return self._read_markdown_sections(task, markdown_paths)
 
+    def _markdown_paragraph_chunks(self, task: PublicTask) -> list[dict[str, str]]:
+        doc_dir = task.context_dir / "doc"
+        if not doc_dir.exists():
+            return []
+        chunks: list[dict[str, str]] = []
+        for path in sorted(doc_dir.rglob("*.md")):
+            if not path.is_file():
+                continue
+            table_name = re.sub(r"\W+", "_", path.stem).strip("_").lower() or "document"
+            current_section = ""
+            current_lines: list[str] = []
+            chunk_index = 1
+
+            def flush() -> None:
+                nonlocal current_lines, chunk_index
+                text = " ".join(line.strip() for line in current_lines if line.strip()).strip()
+                current_lines = []
+                if not text or text.startswith("#") or set(text) <= {"-"}:
+                    return
+                chunks.append(
+                    {
+                        "chunk_id": f"{table_name}:{chunk_index}",
+                        "table": table_name,
+                        "section": current_section,
+                        "text": text[:MARKDOWN_LLM_MAX_CHUNK_CHARS],
+                    }
+                )
+                chunk_index += 1
+
+            for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw_line.strip()
+                heading_match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+                if heading_match is not None:
+                    flush()
+                    current_section = heading_match.group(2).strip()
+                    continue
+                if not line:
+                    flush()
+                    continue
+                current_lines.append(line)
+            flush()
+        return chunks
+
+    def _markdown_doc_table_names(self, task: PublicTask) -> set[str]:
+        doc_dir = task.context_dir / "doc"
+        if not doc_dir.exists():
+            return set()
+        return {
+            re.sub(r"\W+", "_", path.stem).strip("_").lower() or "document"
+            for path in doc_dir.rglob("*.md")
+            if path.is_file()
+        }
+
+    def _select_markdown_chunks_for_question(
+        self,
+        task: PublicTask,
+        allowed_doc_tables: set[str] | None = None,
+    ) -> list[dict[str, str]]:
+        chunks = self._markdown_paragraph_chunks(task)
+        if allowed_doc_tables is not None:
+            chunks = [chunk for chunk in chunks if chunk["table"] in allowed_doc_tables]
+        if not chunks:
+            return []
+
+        query_terms = _tokenize_query_text(task.question)
+        scored_chunks: list[tuple[float, dict[str, str]]] = []
+        for chunk in chunks:
+            searchable = f"{chunk['table']} {chunk['section']} {chunk['text']}".lower()
+            score = 0.0
+            for term in query_terms:
+                if term in searchable:
+                    score += 2.0 if term in chunk["text"].lower() else 1.0
+            if re.search(r"\bpatient\s+\d{4,9}\b", searchable):
+                score += 0.25
+            if chunk["table"] in {"patient", "laboratory"}:
+                score += 0.3
+            if score > 0:
+                scored_chunks.append((score, chunk))
+
+        scored_chunks.sort(key=lambda item: item[0], reverse=True)
+        selected: list[dict[str, str]] = []
+        used_ids: set[str] = set()
+        total_chars = 0
+
+        chunks_by_table: dict[str, list[tuple[float, dict[str, str]]]] = {}
+        for item in scored_chunks:
+            chunks_by_table.setdefault(item[1]["table"], []).append(item)
+        table_quota = max(8, MARKDOWN_LLM_MAX_SELECTED_CHUNKS // max(len(chunks_by_table), 1))
+        ordered_candidates: list[tuple[float, dict[str, str]]] = []
+        for table_name in sorted(chunks_by_table):
+            ordered_candidates.extend(chunks_by_table[table_name][:table_quota])
+        ordered_candidates.extend(scored_chunks)
+
+        for _, chunk in ordered_candidates:
+            if chunk["chunk_id"] in used_ids:
+                continue
+            next_chars = len(chunk["text"])
+            if total_chars + next_chars > MARKDOWN_LLM_MAX_SELECTED_CHARS:
+                continue
+            selected.append(chunk)
+            used_ids.add(chunk["chunk_id"])
+            total_chars += next_chars
+            reserve_for_id_linked = 4 if chunk["table"] != "patient" else 0
+            if len(selected) >= MARKDOWN_LLM_MAX_SELECTED_CHUNKS - reserve_for_id_linked:
+                break
+
+        selected_ids: set[str] = set()
+        for chunk in selected:
+            if chunk["table"] != "patient":
+                selected_ids.update(_extract_patient_ids_from_text(chunk["text"]))
+        if selected_ids:
+            patient_candidates = [
+                chunk
+                for chunk in chunks
+                if chunk["table"] == "patient"
+                and chunk["chunk_id"] not in used_ids
+                and (_extract_patient_ids_from_text(chunk["text"]) & selected_ids)
+            ]
+        else:
+            patient_candidates = []
+
+        if selected_ids and patient_candidates:
+            for candidate in patient_candidates:
+                if candidate["chunk_id"] in used_ids:
+                    continue
+                while len(selected) >= MARKDOWN_LLM_MAX_SELECTED_CHUNKS:
+                    removable_index = next(
+                        (
+                            index
+                            for index in range(len(selected) - 1, -1, -1)
+                            if selected[index]["table"] == "patient"
+                            and not (_extract_patient_ids_from_text(selected[index]["text"]) & selected_ids)
+                        ),
+                        None,
+                    )
+                    if removable_index is None:
+                        break
+                    removed = selected.pop(removable_index)
+                    used_ids.discard(removed["chunk_id"])
+                    total_chars -= len(removed["text"])
+                if len(selected) >= MARKDOWN_LLM_MAX_SELECTED_CHUNKS:
+                    break
+                next_chars = len(candidate["text"])
+                if total_chars + next_chars > MARKDOWN_LLM_MAX_SELECTED_CHARS:
+                    continue
+                selected.append(candidate)
+                used_ids.add(candidate["chunk_id"])
+                total_chars += next_chars
+        return selected
+
+    def _build_markdown_extraction_prompt(
+        self,
+        task: PublicTask,
+        chunks: list[dict[str, str]],
+    ) -> str:
+        chunk_payload = [
+            {
+                "chunk_id": chunk["chunk_id"],
+                "table": chunk["table"],
+                "section": chunk["section"],
+                "text": chunk["text"],
+            }
+            for chunk in chunks
+        ]
+        return (
+            "Stage: query-focused markdown-to-table extraction.\n\n"
+            "You are given selected paragraphs from context/doc/*.md. Each file name is a "
+            "candidate table name, and paragraphs often describe one row or a partial row. "
+            "Use the question, schema knowledge, file names, section names, and paragraph text "
+            "to decide which tables and columns are needed. Extract only structured rows needed "
+            "to answer the question; do not reconstruct the whole database.\n\n"
+            "Rules:\n"
+            "- Return exactly one JSON object.\n"
+            "- Use table names exactly from chunk.table.\n"
+            "- Choose output tables based on relevant doc file names and knowledge.md schema. "
+            "For example, chunks from Patient.md should produce table patient only if patient "
+            "fields are needed; chunks from Laboratory.md should produce table laboratory only "
+            "if lab fields are needed.\n"
+            "- Extract explicit values only; use null when unavailable.\n"
+            "- Prefer corrected, confirmed, verified, final, revised, or adjusted values over "
+            "initial/preliminary values.\n"
+            "- Include key fields such as ID, Date, Birthday, foreign keys, and any "
+            "question-relevant fields. Preserve join keys explicitly mentioned in the text, "
+            "such as cards_id, member_id, event_id, or link/reference identifiers.\n"
+            "- If a doc file represents a missing table needed to join with already-loaded "
+            "structured tables, prioritize the columns needed for that join and the task "
+            "filter. For legality/ruling documents, extract ID, cards_id, format, and status "
+            "when supported by the question, schema knowledge, file name, or paragraph text.\n"
+            "- For any field-specific status column, mark abnormal/normal/borderline only when "
+            "the same measurement is explicitly described that way, or when the text gives an "
+            "explicit reference range/threshold for that measurement. Do not transfer a broader "
+            "panel, organ-system, or neighboring-field abnormality onto a specific field.\n"
+            "- If a paragraph says a general profile is abnormal, but the target measurement "
+            "itself is only mentioned as a value without an explicit abnormal/high/elevated/low "
+            "qualifier, extract the value and leave that measurement status null.\n"
+            "- For creatinine, use column CRE and CRE_status only when creatinine/CRE itself is "
+            "explicitly high/elevated/abnormal, normal, or borderline; do not infer CRE_status "
+            "from urea nitrogen, uric acid, renal profile, or glomerular filtration wording alone.\n"
+            "- Preserve row granularity. For lab rows, prefer ID + Date. For patient rows, "
+            "prefer one row per ID.\n"
+            "- Add source_chunk_id to every extracted row.\n\n"
+            "Return JSON shape:\n"
+            "{\n"
+            "  \"thought\": \"brief extraction rationale\",\n"
+            "  \"tables\": {\n"
+            "    \"table_name\": [\n"
+            "      {\"ID\": 123, \"Date\": \"YYYY-MM-DD\", \"field\": \"value\", "
+            "\"source_chunk_id\": \"table:1\"}\n"
+            "    ]\n"
+            "  }\n"
+            "}\n\n"
+            f"Question:\n{task.question}\n\n"
+            f"Schema knowledge from context/knowledge.md:\n{self._catalog_knowledge_text(task)[:5000] or '(missing)'}\n\n"
+            f"Selected chunks:\n{json.dumps(chunk_payload, ensure_ascii=False, indent=2)}"
+        )
+
+    def _markdown_extraction_batches(
+        self,
+        chunks: list[dict[str, str]],
+    ) -> list[list[dict[str, str]]]:
+        batches: list[list[dict[str, str]]] = []
+        current: list[dict[str, str]] = []
+        current_chars = 0
+        for chunk in chunks:
+            next_chars = len(chunk["text"])
+            if current and (
+                len(current) >= MARKDOWN_LLM_BATCH_CHUNKS
+                or current_chars + next_chars > MARKDOWN_LLM_MAX_CONTEXT_CHARS
+            ):
+                batches.append(current)
+                current = []
+                current_chars = 0
+            current.append(chunk)
+            current_chars += next_chars
+        if current:
+            batches.append(current)
+        return batches
+
+    def _extract_markdown_batch(
+        self,
+        task: PublicTask,
+        batch_index: int,
+        batch_chunks: list[dict[str, str]],
+        allowed_tables: set[str],
+    ) -> tuple[int, str, dict[str, list[dict[str, Any]]], str | None]:
+        try:
+            raw_response, payload = self._complete_json(
+                self._build_markdown_extraction_prompt(task, batch_chunks)
+            )
+            tables = payload.get("tables")
+            if not isinstance(tables, dict):
+                raise ValueError("Markdown extraction response must contain a tables object.")
+            rows_by_table: dict[str, list[dict[str, Any]]] = {}
+            for table_name, rows in tables.items():
+                normalized_table = re.sub(r"\W+", "_", str(table_name)).strip("_").lower()
+                if normalized_table not in allowed_tables or not isinstance(rows, list):
+                    continue
+                cleaned_rows = [row for row in rows if isinstance(row, dict)]
+                if cleaned_rows:
+                    rows_by_table.setdefault(normalized_table, []).extend(cleaned_rows)
+            return batch_index, raw_response, rows_by_table, None
+        except Exception as exc:  # noqa: BLE001
+            return batch_index, "", {}, str(exc)
+
+    def _augment_markdown_tables_with_llm(
+        self,
+        task: PublicTask,
+        state: AgentRuntimeState,
+        engine: DataEngine,
+        allowed_doc_tables: set[str] | None = None,
+    ) -> None:
+        chunks = self._select_markdown_chunks_for_question(
+            task,
+            allowed_doc_tables=allowed_doc_tables,
+        )
+        if not chunks:
+            return
+
+        try:
+            batches = self._markdown_extraction_batches(chunks)
+            rows_by_table: dict[str, list[dict[str, Any]]] = {}
+            raw_responses: list[str] = []
+            batch_errors: list[str] = []
+            allowed_tables = {chunk["table"] for chunk in chunks}
+
+            max_workers = max(
+                1,
+                min(self.config.markdown_extract_max_workers, len(batches)),
+            )
+            batch_results: list[tuple[int, str, dict[str, list[dict[str, Any]]], str | None]] = []
+            if max_workers == 1:
+                for batch_index, batch_chunks in enumerate(batches, start=1):
+                    batch_results.append(
+                        self._extract_markdown_batch(
+                            task,
+                            batch_index,
+                            batch_chunks,
+                            allowed_tables,
+                        )
+                    )
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_batch = {
+                        executor.submit(
+                            self._extract_markdown_batch,
+                            task,
+                            batch_index,
+                            batch_chunks,
+                            allowed_tables,
+                        ): batch_index
+                        for batch_index, batch_chunks in enumerate(batches, start=1)
+                    }
+                    for future in as_completed(future_to_batch):
+                        batch_results.append(future.result())
+
+            for batch_index, raw_response, batch_rows, error in sorted(
+                batch_results,
+                key=lambda item: item[0],
+            ):
+                if error is not None:
+                    batch_errors.append(f"batch {batch_index}: {error}")
+                    continue
+                raw_responses.append(f"[batch {batch_index}]\n{raw_response}")
+                for table_name, rows in batch_rows.items():
+                    rows_by_table.setdefault(table_name, []).extend(rows)
+
+            registered_tables: list[str] = []
+            for normalized_table, cleaned_rows in rows_by_table.items():
+                deduped_rows: list[dict[str, Any]] = []
+                seen_rows: set[str] = set()
+                for row in cleaned_rows:
+                    row_key = json.dumps(row, sort_keys=True, default=str, ensure_ascii=False)
+                    if row_key in seen_rows:
+                        continue
+                    seen_rows.add(row_key)
+                    deduped_rows.append(row)
+                if not deduped_rows:
+                    continue
+                base_columns = set(engine.catalog.get(normalized_table, {}).get("columns", []))
+                extracted_columns = {
+                    str(column)
+                    for row in deduped_rows
+                    for column in row
+                    if str(column) != "source_chunk_id"
+                }
+                if base_columns and extracted_columns and extracted_columns <= base_columns:
+                    continue
+                output_table_name = (
+                    f"{normalized_table}_llm" if base_columns else normalized_table
+                )
+                registered_name = engine.register_rows(
+                    output_table_name,
+                    deduped_rows,
+                    source_type="markdown_llm",
+                    source_path=f"{task.task_id}:{normalized_table}",
+                )
+                if registered_name is not None:
+                    registered_tables.append(registered_name)
+
+            if not registered_tables and not engine.tables:
+                error_detail = "; ".join(batch_errors) if batch_errors else "no rows returned"
+                raise ValueError(f"Markdown extraction produced no queryable rows: {error_detail}")
+
+            self._append_step(
+                task.task_id,
+                state,
+                phase="markdown_extract",
+                thought="Extracted query-focused rows from markdown batches.",
+                action="extract_markdown_rows",
+                action_input={
+                    "chunk_count": len(chunks),
+                    "batch_count": len(batches),
+                    "batch_max_workers": max_workers,
+                    "allowed_doc_tables": sorted(allowed_doc_tables) if allowed_doc_tables else None,
+                    "chunk_ids": [chunk["chunk_id"] for chunk in chunks],
+                },
+                raw_response="\n\n".join(raw_responses),
+                observation={
+                    "ok": True,
+                    "content": {
+                        "registered_tables": registered_tables,
+                        "batch_errors": batch_errors,
+                    },
+                },
+                ok=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._append_step(
+                task.task_id,
+                state,
+                phase="markdown_extract",
+                thought="Markdown LLM extraction failed; continuing with existing DataEngine tables.",
+                action="extract_markdown_rows",
+                action_input={
+                    "chunk_count": len(chunks),
+                    "allowed_doc_tables": sorted(allowed_doc_tables) if allowed_doc_tables else None,
+                    "chunk_ids": [chunk["chunk_id"] for chunk in chunks],
+                },
+                raw_response="",
+                observation={
+                    "ok": False,
+                    "error": str(exc),
+                },
+                ok=False,
+            )
+
     def _append_step(
         self,
         task_id: str,
@@ -580,8 +1060,8 @@ class ReActAgent:
     def _load_data(self, task: PublicTask, state: AgentRuntimeState) -> DataEngine:
         engine = DataEngine()
         loaded_data = engine.register_context_dir(task.context_dir)
+        loaded_ok = bool(loaded_data.get("success"))
         state.loaded_data = loaded_data
-        ok = bool(loaded_data.get("table_count")) and bool(loaded_data.get("success"))
         self._append_step(
             task.task_id,
             state,
@@ -591,13 +1071,29 @@ class ReActAgent:
             action_input={"context_dir": str(task.context_dir)},
             raw_response="",
             observation={
-                "ok": ok,
+                "ok": loaded_ok,
                 "content": loaded_data,
             },
-            ok=ok,
+            ok=loaded_ok,
         )
-        if not ok:
+        if not loaded_ok:
             raise RuntimeError("DataEngine failed to load all supported context files.")
+
+        if not engine.tables:
+            self._augment_markdown_tables_with_llm(task, state, engine)
+        else:
+            existing_tables = set(engine.tables)
+            missing_doc_tables = self._markdown_doc_table_names(task) - existing_tables
+            if missing_doc_tables:
+                self._augment_markdown_tables_with_llm(
+                    task,
+                    state,
+                    engine,
+                    allowed_doc_tables=missing_doc_tables,
+                )
+        loaded_data["table_count"] = len(engine.tables)
+        if not engine.tables:
+            raise RuntimeError("DataEngine failed to load or extract any queryable tables.")
         return engine
 
     def _generate_catalog(

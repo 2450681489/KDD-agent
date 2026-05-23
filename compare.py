@@ -379,7 +379,7 @@ def main():
     # =========================
     # save report
     # =========================
-    with open("per_task_report_0518_2.json", "w") as f:
+    with open("per_task_report_0518_2.json", "w", encoding="utf-8") as f:
         json.dump(final_report, f, indent=2, ensure_ascii=False)
 
     print("\nSaved: per_task_report_0518_2.json")

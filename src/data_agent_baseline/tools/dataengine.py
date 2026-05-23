@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import pandas as pd
 import sqlglot
 from sqlglot import exp
 from datetime import date, datetime, time
@@ -160,6 +161,605 @@ class DataEngine:
             "table_count": len(tables),
             "tables": tables,
         }
+
+    def register_rows(
+        self,
+        table_name: str,
+        rows: list[dict[str, Any]],
+        *,
+        source_type: str = "extracted",
+        source_path: str = "memory",
+    ) -> str | None:
+        if not rows:
+            return None
+        safe_table_name = self._reserve_table_name(self._sanitize_identifier(table_name))
+        self._register_dataframe(
+            safe_table_name,
+            rows,
+            source_type=source_type,
+            file_path=source_path,
+        )
+        return safe_table_name
+
+    def _register_markdown_docs(self, context_root: Path) -> dict[str, Any]:
+        doc_root = context_root / "doc"
+        if not doc_root.is_dir():
+            return {"loaded_files": [], "failed_files": []}
+
+        loaded_files = []
+        failed_files = []
+        for path in sorted(doc_root.rglob("*.md")):
+            try:
+                rows = self._extract_markdown_rows(path)
+                if not rows:
+                    continue
+                table_name = self._reserve_table_name(self._make_table_name(str(path)))
+                self._register_dataframe(
+                    table_name,
+                    rows,
+                    source_type="markdown",
+                    file_path=str(path.resolve()),
+                )
+                loaded_files.append(
+                    {
+                        "path": path.relative_to(context_root).as_posix(),
+                        "table": table_name,
+                        "tables": [table_name],
+                        "source_type": "markdown",
+                        "file_size_bytes": path.stat().st_size,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed_files.append(
+                    {
+                        "path": path.relative_to(context_root).as_posix(),
+                        "error": str(exc),
+                    }
+                )
+        return {"loaded_files": loaded_files, "failed_files": failed_files}
+
+    def _register_dataframe(
+        self,
+        table_name: str,
+        rows: list[dict[str, Any]],
+        *,
+        source_type: str,
+        file_path: str,
+    ) -> None:
+        df = pd.DataFrame(rows)
+        temp_name = f"_tmp_{table_name}_{hashlib.md5(file_path.encode()).hexdigest()[:8]}"
+        self.conn.register(temp_name, df)
+        try:
+            self.conn.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM {temp_name};")
+        finally:
+            try:
+                self.conn.unregister(temp_name)
+            except Exception:
+                pass
+        self.tables.add(table_name)
+        self.catalog[table_name] = {
+            "source_type": source_type,
+            "columns": self._get_columns(table_name),
+            "_meta": {
+                "file_path": file_path,
+            },
+        }
+
+    def _extract_markdown_rows(self, path: Path) -> list[dict[str, Any]]:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        table_hint = self._sanitize_identifier(path.stem)
+        if table_hint == "patient":
+            return self._extract_patient_markdown(text)
+        if table_hint == "laboratory":
+            return self._extract_laboratory_markdown(text)
+        return self._extract_generic_markdown(text, table_hint)
+
+    def _extract_patient_markdown(self, text: str) -> list[dict[str, Any]]:
+        rows_by_id: dict[int, dict[str, Any]] = {}
+        for chunk_index, (section, paragraph) in enumerate(self._markdown_paragraphs(text), start=1):
+            patient_id = self._extract_patient_id(paragraph)
+            if patient_id is None:
+                continue
+            row = rows_by_id.setdefault(
+                patient_id,
+                {
+                    "ID": patient_id,
+                    "SEX": None,
+                    "Birthday": None,
+                    "Description": None,
+                    "First_Date": None,
+                    "Admission": None,
+                    "Diagnosis": None,
+                    "source_chunk_ids": "",
+                },
+            )
+            row["source_chunk_ids"] = self._append_source_id(
+                row.get("source_chunk_ids"),
+                f"patient:{chunk_index}",
+            )
+
+            sex = self._extract_sex(paragraph)
+            if sex is not None:
+                row["SEX"] = sex
+
+            birthday = self._extract_birthday(paragraph)
+            if birthday is not None:
+                row["Birthday"] = birthday
+
+            description = self._extract_record_date(paragraph)
+            if description is not None:
+                row["Description"] = description
+
+            first_date = self._extract_first_visit_date(paragraph)
+            if first_date is not None:
+                row["First_Date"] = first_date
+
+            admission = self._extract_admission(paragraph)
+            if admission is not None:
+                row["Admission"] = admission
+
+            diagnosis = self._extract_diagnosis(paragraph)
+            if diagnosis is not None:
+                row["Diagnosis"] = diagnosis
+
+        return list(rows_by_id.values())
+
+    def _extract_laboratory_markdown(self, text: str) -> list[dict[str, Any]]:
+        rows_by_key: dict[tuple[int, str | None], dict[str, Any]] = {}
+        for chunk_index, (section, paragraph) in enumerate(self._markdown_paragraphs(text), start=1):
+            patient_ids = self._extract_patient_ids(paragraph)
+            if not patient_ids:
+                continue
+            row_date = self._extract_lab_date(paragraph)
+            metrics = self._extract_lab_metrics(paragraph)
+            if not metrics and not self._has_lab_null_panel(paragraph):
+                continue
+
+            for patient_id in patient_ids:
+                key = (patient_id, row_date)
+                row = rows_by_key.setdefault(
+                    key,
+                    {
+                        "ID": patient_id,
+                        "Date": row_date,
+                        "section": section,
+                        "source_chunk_ids": "",
+                    },
+                )
+                row["source_chunk_ids"] = self._append_source_id(
+                    row.get("source_chunk_ids"),
+                    f"laboratory:{chunk_index}",
+                )
+                if row.get("Date") is None and row_date is not None:
+                    row["Date"] = row_date
+                if row.get("section") in (None, "") and section:
+                    row["section"] = section
+                row.update(metrics)
+
+        return list(rows_by_key.values())
+
+    def _extract_generic_markdown(self, text: str, table_hint: str) -> list[dict[str, Any]]:
+        rows = []
+        for chunk_index, (section, paragraph) in enumerate(self._markdown_paragraphs(text), start=1):
+            patient_id = self._extract_patient_id(paragraph)
+            if patient_id is None:
+                continue
+            rows.append(
+                {
+                    "ID": patient_id,
+                    "section": section,
+                    "text": paragraph,
+                    "source_chunk_id": f"{table_hint}:{chunk_index}",
+                }
+            )
+        return rows
+
+    def _markdown_paragraphs(self, text: str) -> list[tuple[str, str]]:
+        paragraphs: list[tuple[str, str]] = []
+        current_section = ""
+        current_lines: list[str] = []
+
+        def flush() -> None:
+            nonlocal current_lines
+            paragraph = " ".join(line.strip() for line in current_lines if line.strip()).strip()
+            current_lines = []
+            if not paragraph:
+                return
+            if paragraph.startswith("#") or set(paragraph) <= {"-"}:
+                return
+            paragraphs.append((current_section, paragraph))
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            heading_match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+            if heading_match:
+                flush()
+                current_section = heading_match.group(2).strip()
+                continue
+            if not line:
+                flush()
+                continue
+            current_lines.append(line)
+        flush()
+        return paragraphs
+
+    def _append_source_id(self, existing: Any, source_id: str) -> str:
+        if not existing:
+            return source_id
+        parts = str(existing).split("|")
+        if source_id in parts:
+            return str(existing)
+        return f"{existing}|{source_id}"
+
+    def _extract_patient_ids(self, text: str) -> list[int]:
+        patterns = [
+            r"\bpatient(?:\s+(?:assigned|registered|associated|with|number|file|ID))*\s*(?:number|ID)?\s*(\d{4,9})\b",
+            r"\bMedical Record Number\s+(\d{4,9})\b",
+            r"\bfile number\s+(\d{4,9})\b",
+            r"\bfile\s+(\d{4,9})\b",
+        ]
+        ids: list[int] = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                patient_id = int(match.group(1))
+                if patient_id not in ids:
+                    ids.append(patient_id)
+        return ids
+
+    def _extract_patient_id(self, text: str) -> int | None:
+        ids = self._extract_patient_ids(text)
+        return ids[0] if ids else None
+
+    def _extract_sex(self, text: str) -> str | None:
+        lowered = text.lower()
+        if re.search(r"\b(female|she|her)\b", lowered):
+            return "F"
+        if re.search(r"\b(male|he|his)\b", lowered):
+            return "M"
+        return None
+
+    def _extract_birthday(self, text: str) -> str | None:
+        patterns = [
+            r"(?:born|birthday|birthdate|date of birth)[^.;]*?(?:correct(?:ed)?(?: date)? (?:is|to)|confirmed(?: the correct date)? (?:is|to)|rectified to|to the correct date of)\s+([^.;]+)",
+            r"(?:born|birthday|birthdate|date of birth)[^.;]*?\b(?:on|as|is|was)\s+([^.;]+)",
+            r"birth year .*? corrected .*? to\s+([^.;]+)",
+        ]
+        return self._extract_date_by_patterns(text, patterns)
+
+    def _extract_record_date(self, text: str) -> str | None:
+        patterns = [
+            r"(?:record|chart|file|data)[^.;]*?(?:correct(?:ed)?|confirmed|amended)[^.;]*?(?:as|to|is)\s+([^.;]+)",
+            r"(?:record|chart|file)[^.;]*?(?:created|opened|initiated|established|formal creation|formally opened)[^.;]*?\b(?:on|as|is|was)\s+([^.;]+)",
+            r"(?:data (?:was )?(?:recorded|entered)|first data recording)[^.;]*?\b(?:on|as|is|was)\s+([^.;]+)",
+        ]
+        return self._extract_date_by_patterns(text, patterns)
+
+    def _extract_first_visit_date(self, text: str) -> str | None:
+        patterns = [
+            r"first (?:hospital )?visit[^.;]*?(?:correct(?:ed)?|confirmed|amended)[^.;]*?(?:as|to|is)\s+([^.;]+)",
+            r"first (?:hospital )?visit[^.;]*?\b(?:on|occurred on|was on|recorded on)\s+([^.;]+)",
+            r"first came to the hospital\s+on\s+([^.;]+)",
+            r"first seen\s+on\s+([^.;]+)",
+        ]
+        return self._extract_date_by_patterns(text, patterns)
+
+    def _extract_admission(self, text: str) -> str | None:
+        lowered = text.lower()
+        if "outpatient" in lowered or "followed in the outpatient clinic" in lowered:
+            return "-"
+        if "inpatient" in lowered or "admitted" in lowered or "required an inpatient stay" in lowered:
+            return "+"
+        return None
+
+    def _extract_diagnosis(self, text: str) -> str | None:
+        patterns = [
+            r"diagnos(?:is|es) of\s+([A-Za-z0-9+/\- ,]+?)(?:\s+(?:required|necessitated|and|in|with)\b|[.;])",
+            r"diagnosed with\s+([A-Za-z0-9+/\- ,]+?)(?:\s+(?:required|necessitated|and|in|with)\b|[.;])",
+            r"managed for\s+([A-Za-z0-9+/\- ,]+?)(?:\s+(?:in|on|with)\b|[.;])",
+            r"followed .*? for\s+([A-Za-z0-9+/\- ,]+?)(?:\s+(?:in|on|with)\b|[.;])",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                diagnosis = match.group(1).strip(" ,")
+                return re.sub(r"\s+", " ", diagnosis)
+        return None
+
+    def _extract_lab_date(self, text: str) -> str | None:
+        patterns = [
+            r"(?:from|on|dated|date of|corresponding to(?: the)? sample from|records from|tested on|assessed on|evaluated on|collected on)\s+([^,;.]+(?:,\s*\d{4})?)",
+        ]
+        return self._extract_date_by_patterns(text, patterns)
+
+    def _extract_lab_metrics(self, text: str) -> dict[str, Any]:
+        metrics: dict[str, Any] = {}
+        aliases = {
+            "GOT": ["GOT", "glutamic oxaloacetic transaminase"],
+            "GPT": ["GPT", "glutamic pyruvic transaminase"],
+            "LDH": ["LDH", "lactate dehydrogenase"],
+            "ALP": ["ALP", "alkaline phosphatase"],
+            "T_BIL": ["T-BIL", "total bilirubin"],
+            "TP": ["total protein", "TP"],
+            "ALB": ["albumin", "ALB"],
+            "UA": ["uric acid", "UA"],
+            "UN": ["urea nitrogen", "UN"],
+            "CRE": ["creatinine", "CRE"],
+            "CPK": ["CPK"],
+            "WBC": ["WBC", "white blood cell"],
+            "RBC": ["RBC", "red blood cell"],
+            "HGB": ["HGB", "hemoglobin"],
+            "PLT": ["PLT", "platelet"],
+            "APTT": ["APTT"],
+            "PT": ["PT"],
+            "IGG": ["IgG", "IGG"],
+            "IGA": ["IgA", "IGA"],
+            "IGM": ["IgM", "IGM"],
+            "C3": ["C3"],
+            "C4": ["C4"],
+            "CRP": ["CRP"],
+            "RF": ["RF"],
+            "RA": ["RA"],
+        }
+        for column, column_aliases in aliases.items():
+            value = self._extract_metric_value(text, column_aliases)
+            if value is not None:
+                metrics[column] = value
+        cre_status = self._extract_cre_status(text, metrics.get("CRE"))
+        if cre_status is not None:
+            metrics["CRE_status"] = cre_status
+        return metrics
+
+    def _extract_metric_value(self, text: str, aliases: list[str]) -> float | str | None:
+        sentences = re.split(r"(?<=[.;])\s+", text)
+        for sentence in sentences:
+            if not any(re.search(rf"\b{re.escape(alias)}\b", sentence, flags=re.IGNORECASE) for alias in aliases):
+                continue
+            if re.search(r"\b(?:NaN|None|not available|not recorded|unavailable|not measured|not performed)\b", sentence, flags=re.IGNORECASE):
+                return None
+            if re.search(r"\b(?:data voids?|data gaps?|complete absence|lacked .* data|no .* data)\b", sentence, flags=re.IGNORECASE):
+                return None
+
+            lowered = sentence.lower()
+            numbers = [float(match.group(1)) for match in re.finditer(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", sentence)]
+            if not numbers:
+                qualitative = self._extract_qualitative_value(sentence, aliases)
+                if qualitative is not None:
+                    return qualitative
+                continue
+
+            if any(word in lowered for word in ["correct", "confirmed", "verified", "final", "revised", "adjusted", "rectified"]):
+                return numbers[-1]
+
+            alias_positions = [
+                match.end()
+                for alias in aliases
+                for match in re.finditer(rf"\b{re.escape(alias)}\b", sentence, flags=re.IGNORECASE)
+            ]
+            if alias_positions:
+                start = min(alias_positions)
+                tail = sentence[start:]
+                stop_positions = [
+                    pos
+                    for marker in self._metric_markers()
+                    for pos in [tail.lower().find(marker)]
+                    if pos > 0
+                ]
+                if stop_positions:
+                    tail = tail[: min(stop_positions)]
+                tail_numbers = [
+                    float(match.group(1))
+                    for match in re.finditer(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", tail)
+                ]
+                if tail_numbers:
+                    return tail_numbers[0]
+                continue
+            return numbers[-1]
+        return None
+
+    def _metric_markers(self) -> list[str]:
+        return [
+            " got",
+            " gpt",
+            " ldh",
+            " alp",
+            " t-bil",
+            " total bilirubin",
+            " total protein",
+            " albumin",
+            " uric acid",
+            " urea nitrogen",
+            " creatinine",
+            " cpk",
+            " wbc",
+            " rbc",
+            " hgb",
+            " plt",
+            " aptt",
+            " igg",
+            " iga",
+            " igm",
+            " crp",
+        ]
+
+    def _extract_qualitative_value(self, sentence: str, aliases: list[str]) -> str | None:
+        lowered = sentence.lower()
+        if any(alias.lower() in lowered for alias in aliases):
+            if "negative" in lowered or re.search(r"\b-\b", sentence):
+                return "-"
+            if "positive" in lowered or re.search(r"\b\+\b", sentence):
+                return "+"
+        return None
+
+    def _extract_cre_status(self, text: str, cre_value: Any = None) -> str | None:
+        try:
+            numeric_cre = float(cre_value)
+        except (TypeError, ValueError):
+            numeric_cre = None
+        if numeric_cre is not None:
+            if numeric_cre > 1.2:
+                return "abnormal"
+            if numeric_cre == 1.2:
+                return "borderline"
+            return "normal"
+
+        if not re.search(r"\b(?:creatinine|CRE|renal|kidney|glomerular)\b", text, flags=re.IGNORECASE):
+            return None
+        for sentence in re.split(r"(?<=[.;])\s+", text):
+            if not re.search(r"\b(?:creatinine|CRE)\b", sentence, flags=re.IGNORECASE):
+                continue
+            lowered = sentence.lower()
+            if "upper limit of the normal range" in lowered or "borderline renal" in lowered:
+                return "borderline"
+            if any(
+                phrase in lowered
+                for phrase in [
+                    "creatinine was significantly elevated",
+                    "creatinine was elevated",
+                    "creatinine level was significantly elevated",
+                    "creatinine level was elevated",
+                    "indicating impaired renal filtration",
+                    "confirming a significant reduction in renal clearance",
+                ]
+            ):
+                return "abnormal"
+            if "normal" in lowered or "healthy kidney function" in lowered or "within normal" in lowered:
+                return "normal"
+        return None
+
+    def _has_lab_null_panel(self, text: str) -> bool:
+        return bool(
+            re.search(r"\b(?:UA|UN|CRE|GOT|GPT|LDH|ALP|T-BIL)\b", text)
+            and re.search(r"\b(?:NaN|None|not available|unavailable|not recorded)\b", text, flags=re.IGNORECASE)
+        )
+
+    def _extract_date_by_patterns(self, text: str, patterns: list[str]) -> str | None:
+        candidates = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                candidates.append(match.group(1))
+        for candidate in reversed(candidates):
+            parsed = self._parse_fuzzy_date(candidate)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _parse_fuzzy_date(self, text: str) -> str | None:
+        month_map = {
+            "january": 1,
+            "february": 2,
+            "march": 3,
+            "april": 4,
+            "may": 5,
+            "june": 6,
+            "july": 7,
+            "august": 8,
+            "september": 9,
+            "october": 10,
+            "november": 11,
+            "december": 12,
+        }
+        cleaned = text.strip(" .;,")
+        cleaned = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", cleaned, flags=re.IGNORECASE)
+        lowered = cleaned.lower()
+
+        iso_match = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", cleaned)
+        if iso_match:
+            return self._date_or_none(
+                int(iso_match.group(1)),
+                int(iso_match.group(2)),
+                int(iso_match.group(3)),
+            )
+
+        match = re.search(
+            r"\b("
+            + "|".join(month_map)
+            + r")\s+(\d{1,2}),?\s+(\d{4})\b",
+            lowered,
+        )
+        if match:
+            return self._date_or_none(int(match.group(3)), month_map[match.group(1)], int(match.group(2)))
+
+        match = re.search(
+            r"\b(\d{1,2})\s+(?:day of\s+)?("
+            + "|".join(month_map)
+            + r")(?:\s+in)?(?:\s+the\s+year\s+of)?\s+(\d{4})\b",
+            lowered,
+        )
+        if match:
+            return self._date_or_none(int(match.group(3)), month_map[match.group(2)], int(match.group(1)))
+
+        match = re.search(
+            r"\b(?:the\s+)?(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth|twenty-first|twenty-second|twenty-third|twenty-fourth|twenty-fifth|twenty-sixth|twenty-seventh|twenty-eighth|twenty-ninth|thirtieth|thirty-first)\s+(?:day\s+)?of\s+("
+            + "|".join(month_map)
+            + r").*?(\d{4})\b",
+            lowered,
+        )
+        if match:
+            day = self._ordinal_word_to_int(match.group(1))
+            if day is not None:
+                return self._date_or_none(int(match.group(3)), month_map[match.group(2)], day)
+
+        match = re.search(r"\b(late|mid|middle of|end of|near the end of|first week of|final week of)\s+(" + "|".join(month_map) + r").*?(\d{4})\b", lowered)
+        if match:
+            day = {
+                "first week of": 4,
+                "mid": 15,
+                "middle of": 15,
+                "late": 25,
+                "end of": 28,
+                "near the end of": 25,
+                "final week of": 25,
+            }.get(match.group(1), 15)
+            return self._date_or_none(int(match.group(3)), month_map[match.group(2)], day)
+
+        match = re.search(r"\b(\d{4})\b", lowered)
+        if match and any(month in lowered for month in month_map):
+            for month_name, month_number in month_map.items():
+                if month_name in lowered:
+                    return self._date_or_none(int(match.group(1)), month_number, 15)
+        return None
+
+    def _date_or_none(self, year: int, month: int, day: int) -> str | None:
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError:
+            return None
+
+    def _ordinal_word_to_int(self, value: str) -> int | None:
+        mapping = {
+            "first": 1,
+            "second": 2,
+            "third": 3,
+            "fourth": 4,
+            "fifth": 5,
+            "sixth": 6,
+            "seventh": 7,
+            "eighth": 8,
+            "ninth": 9,
+            "tenth": 10,
+            "eleventh": 11,
+            "twelfth": 12,
+            "thirteenth": 13,
+            "fourteenth": 14,
+            "fifteenth": 15,
+            "sixteenth": 16,
+            "seventeenth": 17,
+            "eighteenth": 18,
+            "nineteenth": 19,
+            "twentieth": 20,
+            "twenty-first": 21,
+            "twenty-second": 22,
+            "twenty-third": 23,
+            "twenty-fourth": 24,
+            "twenty-fifth": 25,
+            "twenty-sixth": 26,
+            "twenty-seventh": 27,
+            "twenty-eighth": 28,
+            "twenty-ninth": 29,
+            "thirtieth": 30,
+            "thirty-first": 31,
+        }
+        return mapping.get(value.lower())
 
     def _detect_type(self, file_path):
         # get extension
@@ -394,6 +994,11 @@ class DataEngine:
     def _json_safe_value(self, value: Any) -> Any:
         if value is None:
             return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
         if isinstance(value, datetime):
             if value.time() == time(0,0):
                 return value.date().isoformat()

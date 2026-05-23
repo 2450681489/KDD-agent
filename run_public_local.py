@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,9 +14,9 @@ from data_agent_baseline.config import AgentConfig, AppConfig, DatasetConfig, Ru
 from data_agent_baseline.run.runner import _run_single_task_with_timeout
 
 
-INPUT_ROOT = Path(os.environ.get("INPUT_ROOT", "/input"))
-OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", "/output"))
-LOGS_ROOT = Path(os.environ.get("LOGS_ROOT", "/logs"))
+INPUT_ROOT = Path(os.environ.get("INPUT_ROOT", "data/public/input"))
+OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", "tmp_output"))
+TRACE_ROOT = Path(os.environ.get("TRACE_ROOT", "tmp_traces"))
 
 
 def _required_env(name: str) -> str:
@@ -39,10 +40,9 @@ def _float_env(name: str, default: float) -> float:
     return float(raw_value)
 
 
-def build_submission_config() -> AppConfig:
+def build_local_config() -> AppConfig:
     agent_defaults = AgentConfig()
     run_defaults = RunConfig()
-    max_workers = _int_env("AGENT_MAX_WORKERS", run_defaults.max_workers)
     return AppConfig(
         dataset=DatasetConfig(root_path=INPUT_ROOT),
         agent=replace(
@@ -88,7 +88,7 @@ def build_submission_config() -> AppConfig:
                 "AGENT_TASK_TIMEOUT_SECONDS",
                 run_defaults.task_timeout_seconds,
             ),
-            max_workers=max(1, min(max_workers, 16)),
+            max_workers=max(1, min(_int_env("AGENT_MAX_WORKERS", run_defaults.max_workers), 16)),
         ),
     )
 
@@ -112,6 +112,18 @@ def iter_task_ids(input_root: Path) -> list[str]:
     return [path.name for path in sorted(task_dirs, key=task_sort_key)]
 
 
+def select_task_ids(task_ids: list[str]) -> list[str]:
+    raw_value = os.environ.get("TASK_IDS", "").strip()
+    if not raw_value:
+        return task_ids
+    requested = {
+        item.strip()
+        for item in raw_value.split(",")
+        if item.strip()
+    }
+    return [task_id for task_id in task_ids if task_id in requested]
+
+
 def write_prediction_csv(task_id: str, answer: dict[str, Any] | None) -> Path:
     out_dir = OUTPUT_ROOT / task_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -124,7 +136,6 @@ def write_prediction_csv(task_id: str, answer: dict[str, Any] | None) -> Path:
     else:
         columns = ["answer"]
         rows = []
-
     if not columns:
         columns = ["answer"]
 
@@ -132,32 +143,26 @@ def write_prediction_csv(task_id: str, answer: dict[str, Any] | None) -> Path:
         writer = csv.writer(handle)
         writer.writerow(columns)
         for row in rows:
-            if isinstance(row, list):
-                writer.writerow(row)
-            else:
-                writer.writerow([row])
-
+            writer.writerow(row if isinstance(row, list) else [row])
     return prediction_path
 
 
 def run_task(task_id: str, config: AppConfig) -> dict[str, Any]:
-    trace_dir = Path("/tmp") / "kdd_agent_traces"
-    trace_dir.mkdir(parents=True, exist_ok=True)
-    trace_path = trace_dir / f"{task_id}.json"
-    return _run_single_task_with_timeout(
+    TRACE_ROOT.mkdir(parents=True, exist_ok=True)
+    trace_path = TRACE_ROOT / f"{task_id}.json"
+    run_result = _run_single_task_with_timeout(
         task_id=task_id,
         config=config,
         trace_path=trace_path,
     )
+    trace_path.write_text(
+        json.dumps(run_result, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return run_result
 
 
-def run_and_write_task(
-    *,
-    index: int,
-    total: int,
-    task_id: str,
-    config: AppConfig,
-) -> bool:
+def run_and_write_task(index: int, total: int, task_id: str, config: AppConfig) -> bool:
     task_started_at = perf_counter()
     try:
         run_result = run_task(task_id, config)
@@ -169,9 +174,11 @@ def run_and_write_task(
         succeeded = run_result.get("status") == "completed" and isinstance(answer, dict)
         status = "ok" if succeeded else "fail"
         elapsed = perf_counter() - task_started_at
+        failure_reason = run_result.get("failure_reason")
+        reason_suffix = f", reason={failure_reason}" if failure_reason else ""
         print(
             f"[{index}/{total}] {task_id}: {status}, "
-            f"elapsed={elapsed:.2f}s, output={prediction_path}",
+            f"elapsed={elapsed:.2f}s, output={prediction_path}{reason_suffix}",
             flush=True,
         )
         return succeeded
@@ -189,13 +196,15 @@ def run_and_write_task(
 def main() -> int:
     started_at = perf_counter()
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    LOGS_ROOT.mkdir(parents=True, exist_ok=True)
+    TRACE_ROOT.mkdir(parents=True, exist_ok=True)
 
-    config = build_submission_config()
-    task_ids = iter_task_ids(INPUT_ROOT)
+    config = build_local_config()
+    task_ids = select_task_ids(iter_task_ids(INPUT_ROOT))
     print(
         f"Discovered {len(task_ids)} tasks under {INPUT_ROOT}; "
-        f"max_workers={config.run.max_workers}; "
+        f"output={OUTPUT_ROOT}; traces={TRACE_ROOT}; "
+        f"task_workers={config.run.max_workers}; "
+        f"markdown_workers={config.agent.markdown_extract_max_workers}; "
         f"task_timeout_seconds={config.run.task_timeout_seconds}",
         flush=True,
     )
@@ -204,13 +213,7 @@ def main() -> int:
     failure_count = 0
     with ThreadPoolExecutor(max_workers=config.run.max_workers) as executor:
         future_to_task = {
-            executor.submit(
-                run_and_write_task,
-                index=index,
-                total=len(task_ids),
-                task_id=task_id,
-                config=config,
-            ): task_id
+            executor.submit(run_and_write_task, index, len(task_ids), task_id, config): task_id
             for index, task_id in enumerate(task_ids, start=1)
         }
         for future in as_completed(future_to_task):
