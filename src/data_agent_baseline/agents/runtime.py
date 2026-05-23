@@ -29,6 +29,7 @@ class AgentRuntimeState:
     loaded_data: dict[str, Any] | None = None
     engine_schema: dict[str, Any] | None = None
     catalog: dict[str, Any] | None = None
+    schema_linking: dict[str, Any] | None = None
     plan: dict[str, Any] | None = None
     focused_schema: dict[str, Any] | None = None
     knowledge_chunks: list[dict[str, Any]] = field(default_factory=list)

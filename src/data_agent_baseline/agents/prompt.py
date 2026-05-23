@@ -130,6 +130,105 @@ Requirements:
 Do not write SQL and do not answer the task in this stage.
 """.strip()
 
+SCHEMA_LINKING_PROMPT = """
+Stage: schema_linking.
+
+Read the question and identify literal or fuzzy values that are likely used as
+filters, joins, entity lookups, or value constraints in SQL. These are not column
+names; they are values or phrases that may appear inside database rows, possibly
+with different spelling/casing/wording.
+
+Return JSON with this shape:
+{
+  "thought": "brief reasoning",
+  "filter_terms": [
+    {
+      "term": "literal or fuzzy lookup value",
+      "kind": "entity/category/date/number/text",
+      "reason": "why this value may need database lookup",
+      "alternatives": ["optional synonym or rewritten lookup term"]
+    }
+  ]
+}
+
+Example:
+{
+  "thought": "The event name and shirt size are row values used as filters.",
+  "filter_terms": [
+    {
+      "term": "Women's Soccer",
+      "kind": "entity",
+      "reason": "Specific event name that should be matched to an event/title column.",
+      "alternatives": ["Women Soccer", "Soccer"]
+    },
+    {
+      "term": "Medium",
+      "kind": "category",
+      "reason": "T-shirt size category used as a member filter.",
+      "alternatives": ["M", "medium"]
+    }
+  ]
+}
+
+Rules:
+- Include named entities, event names, product/race/school/person names, categories,
+  statuses, formats, dates, month/year phrases, and numeric identifiers when they are
+  likely used to filter rows.
+- Do not include generic analytical words such as count, average, maximum, minimum,
+  percentage, total, row, table, column, value, records.
+- If a term is fuzzy or could be encoded differently in the database, include 1-3
+  alternatives, e.g. "women soccer" for "Women's Soccer", "commander" for
+  "format commander", or a YYYYMM rewrite for a month/year phrase.
+- Keep the list small and high precision, usually 1-8 terms.
+""".strip()
+
+SCHEMA_LINKING_REFINE_PROMPT = """
+Stage: schema_linking_refine.
+
+Some lookup terms from the previous schema-linking round had no database hits.
+Read the question, schema, no-hit terms, and previous search results. Propose
+revised lookup terms that are more likely to match stored database values.
+
+Return JSON with this shape:
+{
+  "thought": "brief reasoning about why terms were revised",
+  "revised_terms": [
+    {
+      "original_term": "term that had no hits",
+      "term": "new lookup term",
+      "reason": "why this rewrite may match database rows",
+      "alternatives": ["optional additional lookup term"]
+    }
+  ]
+}
+
+Example:
+{
+  "thought": "The original phrase includes prose words; database values are likely shorter names or encoded dates.",
+  "revised_terms": [
+    {
+      "original_term": "format commander and legal status",
+      "term": "commander",
+      "reason": "The format value may be stored as just the format name.",
+      "alternatives": ["Commander"]
+    },
+    {
+      "original_term": "August 2012",
+      "term": "201208",
+      "reason": "The month may be stored as a YYYYMM integer/string.",
+      "alternatives": ["2012-08", "2012/08"]
+    }
+  ]
+}
+
+Rules:
+- Only revise terms that had no useful hits. Do not repeat terms that already had good hits.
+- Prefer shorter database-like values over full natural-language phrases.
+- Use schema column names and sample rows to infer likely encodings, but output lookup values only.
+- Do not write SQL and do not answer the task.
+- Keep revised_terms small and high precision, usually 0-8 entries.
+""".strip()
+
 PLAN_PROMPT = """
 Stage: plan.
 
@@ -252,6 +351,13 @@ Requirements:
 - Aim to generate the final answer SQL in one pass.
 - Do not redesign the query logic if the plan is already sufficient.
 - If a previous attempt failed, revise SQL minimally while preserving the plan semantics.
+- Do not repeat a SQL query that just failed. Use the error text to make a concrete change.
+- If DuckDB reports a conversion error such as "Could not convert string 'X' to DOUBLE"
+  for a string comparison, cast the compared column to VARCHAR, e.g.
+  `CAST(table.column AS VARCHAR) = 'X'`. This commonly happens when an extracted
+  markdown column was inferred as numeric even though the logical field is textual.
+- If DuckDB reports a type/cast error around date or year extraction, cast the source
+  expression to DATE/TIMESTAMP before calling date functions.
 - Prefer focused_schema when it is provided; use full_schema only as a fallback reference.
 - Set "is_final" to true only when the query result is intended to be the final result table for the answer stage.
 """.strip()
@@ -311,6 +417,44 @@ def build_catalog_prompt(
     )
 
 
+def build_schema_linking_prompt(
+    task: PublicTask,
+    *,
+    catalog: dict[str, Any],
+    engine_schema: dict[str, Any],
+    retrieved_knowledge: str = "(none)",
+) -> str:
+    return (
+        f"{SCHEMA_LINKING_PROMPT}\n\n"
+        f"Question:\n{task.question}\n\n"
+        f"Generated catalog:\n{_render_payload(catalog)}\n\n"
+        "Retrieved knowledge from context/knowledge.md:\n"
+        f"{retrieved_knowledge or '(none)'}\n\n"
+        f"DataEngine schema:\n{_render_payload(engine_schema)}"
+    )
+
+
+def build_schema_linking_refine_prompt(
+    task: PublicTask,
+    *,
+    catalog: dict[str, Any],
+    engine_schema: dict[str, Any],
+    retrieved_knowledge: str,
+    previous_linking: dict[str, Any],
+    no_hit_terms: list[dict[str, Any]],
+) -> str:
+    return (
+        f"{SCHEMA_LINKING_REFINE_PROMPT}\n\n"
+        f"Question:\n{task.question}\n\n"
+        f"Generated catalog:\n{_render_payload(catalog)}\n\n"
+        "Retrieved knowledge from context/knowledge.md:\n"
+        f"{retrieved_knowledge or '(none)'}\n\n"
+        f"No-hit terms from previous round:\n{_render_payload({'terms': no_hit_terms})}\n\n"
+        f"Previous search results:\n{_render_payload(previous_linking)}\n\n"
+        f"DataEngine schema:\n{_render_payload(engine_schema)}"
+    )
+
+
 def build_plan_prompt(
     task: PublicTask,
     *,
@@ -318,6 +462,7 @@ def build_plan_prompt(
     engine_schema: dict[str, Any],
     plan_doc_text: str,
     retrieved_knowledge: str = "(none)",
+    schema_linking: dict[str, Any] | None = None,
 ) -> str:
     return (
         f"{PLAN_PROMPT}\n\n"
@@ -334,6 +479,13 @@ def build_plan_prompt(
         "- Capture important knowledge-derived constraints in filters, aggregations, group_by, "
         "order_by, final_columns, or validation_checks.\n\n"
         f"Plan documents from context/doc:\n{plan_doc_text or '(missing)'}\n\n"
+        "Schema linking evidence from database value search:\n"
+        f"{_render_payload(schema_linking or {'terms': []})}\n\n"
+        "Schema linking usage rules:\n"
+        "- Use search hits to map question values to real table columns and stored values.\n"
+        "- If a question phrase has hits in one column, prefer that column for the filter.\n"
+        "- If no exact hit exists, reason from alternatives and sample rows before choosing a filter.\n"
+        "- Do not use search hits that contradict the observed schema or the question intent.\n\n"
         f"DataEngine schema:\n{_render_payload(engine_schema)}"
     )
 

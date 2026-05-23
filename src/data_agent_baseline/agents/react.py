@@ -24,6 +24,8 @@ from data_agent_baseline.agents.prompt import (
     build_catalog_prompt,
     build_nl2sql_prompt,
     build_plan_prompt,
+    build_schema_linking_refine_prompt,
+    build_schema_linking_prompt,
     build_system_prompt,
 )
 from data_agent_baseline.agents.runtime import (
@@ -572,8 +574,21 @@ class ReActAgent:
         ]
 
     def _complete_json(self, user_content: str) -> tuple[str, dict[str, Any]]:
-        raw_response = self.model.complete(self._build_messages(user_content))
-        return raw_response, parse_model_payload(raw_response)
+        last_raw_response = ""
+        last_error: Exception | None = None
+        for _ in range(2):
+            raw_response = self.model.complete(self._build_messages(user_content))
+            last_raw_response = raw_response
+            if not raw_response.strip():
+                last_error = ValueError("Model returned an empty response.")
+                continue
+            try:
+                return raw_response, parse_model_payload(raw_response)
+            except ValueError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        return last_raw_response, parse_model_payload(last_raw_response)
 
     def _task_record_payload(self, task: PublicTask) -> dict[str, Any]:
         task_json_path = task.task_dir / "task.json"
@@ -1243,6 +1258,219 @@ class ReActAgent:
             )
             return empty_result
 
+    def _schema_linking(
+        self,
+        task: PublicTask,
+        state: AgentRuntimeState,
+        engine: DataEngine,
+        catalog: dict[str, Any],
+        engine_schema: dict[str, Any],
+        retrieved_knowledge: str,
+    ) -> dict[str, Any]:
+        def normalize_initial_terms(raw_terms: Any) -> list[dict[str, Any]]:
+            if not isinstance(raw_terms, list):
+                return []
+            term_records: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for item in raw_terms:
+                if not isinstance(item, dict):
+                    continue
+                term = str(item.get("term", "")).strip()
+                if not term:
+                    continue
+                key = term.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                alternatives = [
+                    str(value).strip()
+                    for value in item.get("alternatives", [])
+                    if str(value).strip()
+                ][:3]
+                term_records.append(
+                    {
+                        "term": term,
+                        "kind": str(item.get("kind", "")),
+                        "reason": str(item.get("reason", "")),
+                        "alternatives": alternatives,
+                    }
+                )
+            return term_records
+
+        def normalize_revised_terms(raw_terms: Any) -> list[dict[str, Any]]:
+            if not isinstance(raw_terms, list):
+                return []
+            term_records: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for item in raw_terms:
+                if not isinstance(item, dict):
+                    continue
+                term = str(item.get("term", "")).strip()
+                if not term:
+                    continue
+                key = term.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                alternatives = [
+                    str(value).strip()
+                    for value in item.get("alternatives", [])
+                    if str(value).strip()
+                ][:3]
+                term_records.append(
+                    {
+                        "original_term": str(item.get("original_term", "")).strip(),
+                        "term": term,
+                        "reason": str(item.get("reason", "")),
+                        "alternatives": alternatives,
+                    }
+                )
+            return term_records
+
+        def terms_to_search(term_records: list[dict[str, Any]]) -> list[str]:
+            search_terms: list[str] = []
+            for item in term_records:
+                term = str(item.get("term", "")).strip()
+                if term:
+                    search_terms.append(term)
+                search_terms.extend(
+                    str(value).strip()
+                    for value in item.get("alternatives", [])
+                    if str(value).strip()
+                )
+            return search_terms
+
+        def no_hit_initial_terms(
+            term_records: list[dict[str, Any]],
+            search_result: dict[str, Any],
+        ) -> list[dict[str, Any]]:
+            hits_by_term = {
+                str(item.get("term", "")).lower(): int(item.get("hit_count", 0))
+                for item in search_result.get("terms", [])
+                if isinstance(item, dict)
+            }
+            no_hits: list[dict[str, Any]] = []
+            for item in term_records:
+                candidates = [str(item.get("term", "")).strip()]
+                candidates.extend(str(value).strip() for value in item.get("alternatives", []))
+                if not any(hits_by_term.get(candidate.lower(), 0) > 0 for candidate in candidates):
+                    no_hits.append(item)
+            return no_hits
+
+        try:
+            raw_response, payload = self._complete_json(
+                build_schema_linking_prompt(
+                    task,
+                    catalog=catalog,
+                    engine_schema=engine_schema,
+                    retrieved_knowledge=retrieved_knowledge,
+                )
+            )
+            term_records = normalize_initial_terms(payload.get("filter_terms", []))
+
+            search_result = engine.global_search(
+                terms_to_search(term_records),
+                max_terms=12,
+                max_hits_per_term=8,
+            )
+            rounds: list[dict[str, Any]] = [
+                {
+                    "round": 1,
+                    "kind": "initial",
+                    "thought": str(payload.get("thought", "")),
+                    "terms": term_records,
+                    "search": search_result,
+                }
+            ]
+            raw_responses = [f"[round 1]\n{raw_response}"]
+
+            no_hits = no_hit_initial_terms(term_records, search_result)
+            revised_terms: list[dict[str, Any]] = []
+            refined_search = {"terms": []}
+            if no_hits:
+                refine_raw_response, refine_payload = self._complete_json(
+                    build_schema_linking_refine_prompt(
+                        task,
+                        catalog=catalog,
+                        engine_schema=engine_schema,
+                        retrieved_knowledge=retrieved_knowledge,
+                        previous_linking={
+                            "filter_terms": term_records,
+                            "search": search_result,
+                        },
+                        no_hit_terms=no_hits,
+                    )
+                )
+                raw_responses.append(f"[round 2 refine]\n{refine_raw_response}")
+                revised_terms = normalize_revised_terms(refine_payload.get("revised_terms", []))
+                if revised_terms:
+                    refined_search = engine.global_search(
+                        terms_to_search(revised_terms),
+                        max_terms=12,
+                        max_hits_per_term=8,
+                    )
+                rounds.append(
+                    {
+                        "round": 2,
+                        "kind": "refine",
+                        "thought": str(refine_payload.get("thought", "")),
+                        "terms": revised_terms,
+                        "search": refined_search,
+                    }
+                )
+
+            linked = {
+                "filter_terms": term_records,
+                "no_hit_terms_after_round_1": no_hits,
+                "revised_terms": revised_terms,
+                "rounds": rounds,
+                "search": {
+                    "terms": search_result.get("terms", []) + refined_search.get("terms", []),
+                },
+            }
+            state.schema_linking = linked
+            self._append_step(
+                task.task_id,
+                state,
+                phase="schema_linking",
+                thought="Linked question filter terms to database values with iterative search.",
+                action="schema_link_values",
+                action_input={
+                    "terms": term_records,
+                    "no_hit_terms_after_round_1": no_hits,
+                    "revised_terms": revised_terms,
+                },
+                raw_response="\n\n".join(raw_responses),
+                observation={
+                    "ok": True,
+                    "content": linked,
+                },
+                ok=True,
+            )
+            return linked
+        except Exception as exc:  # noqa: BLE001
+            linked = {
+                "filter_terms": [],
+                "search": {"terms": []},
+                "warning": str(exc),
+            }
+            state.schema_linking = linked
+            self._append_step(
+                task.task_id,
+                state,
+                phase="schema_linking",
+                thought="Schema linking failed; continuing without value search evidence.",
+                action="schema_link_values",
+                action_input={},
+                raw_response="",
+                observation={
+                    "ok": True,
+                    "content": linked,
+                },
+                ok=True,
+            )
+            return linked
+
     def _generate_plan(
         self,
         task: PublicTask,
@@ -1250,6 +1478,7 @@ class ReActAgent:
         catalog: dict[str, Any],
         engine_schema: dict[str, Any],
         retrieved_knowledge: str,
+        schema_linking: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         plan_doc_files, plan_doc_text = self._plan_doc_bundle(task)
         raw_response, payload = self._complete_json(
@@ -1259,6 +1488,7 @@ class ReActAgent:
                 engine_schema=engine_schema,
                 plan_doc_text=plan_doc_text,
                 retrieved_knowledge=retrieved_knowledge,
+                schema_linking=schema_linking,
             )
         )
         plan = payload.get("plan")
@@ -1279,6 +1509,7 @@ class ReActAgent:
                 "content": {
                     "plan_doc_files": plan_doc_files,
                     "retrieved_knowledge": state.retrieved_knowledge,
+                    "schema_linking": schema_linking or {"terms": []},
                     "plan": plan,
                     "focused_schema": state.focused_schema,
                 },
@@ -1483,12 +1714,21 @@ class ReActAgent:
                 engine_schema=engine_schema,
                 catalog=catalog,
             )
+            schema_linking = self._schema_linking(
+                task,
+                state,
+                engine,
+                catalog,
+                engine_schema,
+                retrieved_knowledge,
+            )
             plan = self._generate_plan(
                 task,
                 state,
                 catalog,
                 engine_schema,
                 retrieved_knowledge,
+                schema_linking,
             )
             self._run_nl2sql_loop(
                 task,

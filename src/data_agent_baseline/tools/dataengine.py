@@ -130,6 +130,32 @@ class DataEngine:
                 "error": None,
             }
         except Exception as e:
+            retry_sql = self._rewrite_string_comparison_casts(sql, str(e))
+            if retry_sql is not None and retry_sql != sql:
+                try:
+                    self._validate_read_only_sql(retry_sql)
+                    limited_sql = self._apply_limit(retry_sql, limit + 1)
+                    df = self.conn.execute(limited_sql).fetchdf()
+                    truncated = len(df.index) > limit
+                    if truncated:
+                        df = df.head(limit)
+                    return {
+                        "success": True,
+                        "data": {
+                            "columns": df.columns.tolist(),
+                            "rows": [
+                                [self._json_safe_value(value) for value in row]
+                                for row in df.values.tolist()
+                            ],
+                        },
+                        "row_count": len(df.index),
+                        "truncated": truncated,
+                        "sql": sql,
+                        "rewritten_sql": retry_sql,
+                        "error": None,
+                    }
+                except Exception:
+                    pass
             return {
                 "success": False,
                 "data": None,
@@ -139,6 +165,29 @@ class DataEngine:
                 "rewritten_sql": None,
                 "error": str(e),
             }
+
+    def _rewrite_string_comparison_casts(self, sql: str, error_message: str) -> str | None:
+        if "could not convert string" not in error_message.lower():
+            return None
+        pattern = re.compile(
+            r"(?<![\w.])((?:[A-Za-z_][\w]*\.)?[A-Za-z_][\w]*)\s*=\s*'([^']*)'",
+            flags=re.IGNORECASE,
+        )
+        replacements = 0
+
+        def replace(match: re.Match[str]) -> str:
+            nonlocal replacements
+            column = match.group(1)
+            literal = match.group(2)
+            if column.upper() in {"CAST", "EXTRACT", "DATE", "TIMESTAMP"}:
+                return match.group(0)
+            replacements += 1
+            return f"CAST({column} AS VARCHAR) = '{literal}'"
+
+        rewritten = pattern.sub(replace, sql)
+        if replacements == 0:
+            return None
+        return rewritten
 
     def show_tables(self):
         return {
@@ -162,6 +211,81 @@ class DataEngine:
             "tables": tables,
         }
 
+    def global_search(
+        self,
+        terms: list[str],
+        *,
+        max_terms: int = 8,
+        max_hits_per_term: int = 12,
+        max_value_length: int = 160,
+    ) -> dict[str, Any]:
+        results: dict[str, Any] = {
+            "terms": [],
+            "max_hits_per_term": max_hits_per_term,
+        }
+        clean_terms: list[str] = []
+        seen_terms: set[str] = set()
+        for term in terms:
+            clean_term = str(term).strip()
+            if len(clean_term) < 2:
+                continue
+            key = clean_term.lower()
+            if key in seen_terms:
+                continue
+            seen_terms.add(key)
+            clean_terms.append(clean_term)
+            if len(clean_terms) >= max_terms:
+                break
+
+        for term in clean_terms:
+            hits: list[dict[str, Any]] = []
+            pattern = f"%{term}%"
+            for table_name, entry in sorted(self.catalog.items()):
+                for column in entry.get("columns", []):
+                    if len(hits) >= max_hits_per_term:
+                        break
+                    try:
+                        table_sql = self._quote_identifier(str(table_name))
+                        column_sql = self._quote_identifier(str(column))
+                        query = (
+                            f"SELECT {column_sql} AS _match_value, * "
+                            f"FROM {table_sql} "
+                            f"WHERE CAST({column_sql} AS VARCHAR) ILIKE {self._quote_string(pattern)} "
+                            "LIMIT 2"
+                        )
+                        df = self.conn.execute(query).fetchdf()
+                    except Exception:
+                        continue
+                    for row in df.to_dict(orient="records"):
+                        if len(hits) >= max_hits_per_term:
+                            break
+                        raw_value = self._json_safe_value(row.pop("_match_value", None))
+                        value = "" if raw_value is None else str(raw_value)
+                        if len(value) > max_value_length:
+                            value = value[: max_value_length - 3] + "..."
+                        sample_row = {
+                            key: self._json_safe_value(value)
+                            for key, value in list(row.items())[:8]
+                        }
+                        hits.append(
+                            {
+                                "table": table_name,
+                                "column": str(column),
+                                "value": value,
+                                "sample_row": sample_row,
+                            }
+                        )
+                if len(hits) >= max_hits_per_term:
+                    break
+            results["terms"].append(
+                {
+                    "term": term,
+                    "hit_count": len(hits),
+                    "hits": hits,
+                }
+            )
+        return results
+
     def register_rows(
         self,
         table_name: str,
@@ -173,13 +297,48 @@ class DataEngine:
         if not rows:
             return None
         safe_table_name = self._reserve_table_name(self._sanitize_identifier(table_name))
+        normalized_rows = self._normalize_extracted_rows(rows)
         self._register_dataframe(
             safe_table_name,
-            rows,
+            normalized_rows,
             source_type=source_type,
             file_path=source_path,
         )
         return safe_table_name
+
+    def _normalize_extracted_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        text_name_fragments = {
+            "name",
+            "status",
+            "format",
+            "type",
+            "category",
+            "label",
+            "element",
+            "sex",
+            "gender",
+            "diagnosis",
+            "disease",
+            "publisher",
+            "source",
+            "description",
+            "title",
+            "surname",
+            "forename",
+        }
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            normalized_row: dict[str, Any] = {}
+            for key, value in row.items():
+                key_text = str(key)
+                key_lower = key_text.lower()
+                should_text = any(fragment in key_lower for fragment in text_name_fragments)
+                if should_text and value is not None:
+                    normalized_row[key_text] = str(value)
+                else:
+                    normalized_row[key_text] = value
+            normalized_rows.append(normalized_row)
+        return normalized_rows
 
     def _register_markdown_docs(self, context_root: Path) -> dict[str, Any]:
         doc_root = context_root / "doc"
